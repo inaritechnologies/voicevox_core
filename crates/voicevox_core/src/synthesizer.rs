@@ -1412,6 +1412,44 @@ impl<R: InferenceRuntime> Status<R> {
         Ok(output.to_vec())
     }
 
+    /// Frames `range` only, with MARGIN of context each side.
+    async fn decode_range<A: infer::AsyncExt>(
+        &self,
+        f0: ndarray::Array1<f32>,
+        phoneme: ndarray::Array2<f32>,
+        style_id: StyleId,
+        range: std::ops::Range<usize>,
+    ) -> Result<Vec<f32>> {
+        let (model_id, inner_voice_id) = self.ids_for::<TalkDomain>(style_id)?;
+        let ctx = MARGIN;
+        let n = f0.len();
+        let (_, f0, phoneme) = pad_decoder_feature::<PADDING_FRAME_LENGTH>(f0, phoneme);
+        let start = (range.start + PADDING_FRAME_LENGTH).saturating_sub(ctx);
+        let end = (range.end + PADDING_FRAME_LENGTH + ctx).min(n + 2 * PADDING_FRAME_LENGTH);
+        let (lead, tail) = (range.start + PADDING_FRAME_LENGTH - start, end - range.end - PADDING_FRAME_LENGTH);
+        let DecodeOutput { wave } = self
+            .run_session::<A, _>(
+                model_id,
+                DecodeInput {
+                    f0: f0
+                        .slice(ndarray::s![start..end])
+                        .to_owned()
+                        .into_shape_with_order([end - start, 1])
+                        .unwrap(),
+                    phoneme: phoneme.slice(ndarray::s![start..end, ..]).to_owned(),
+                    speaker_id: ndarray::arr1(&[inner_voice_id.raw_id().into()]),
+                },
+                A::LIGHT_INFERENCE_CANCELLABLE,
+            )
+            .await?;
+        let len = wave.len();
+        Ok(wave
+            .slice_move(ndarray::s![lead * 256..len - tail * 256])
+            .as_standard_layout()
+            .into_owned()
+            .into_vec())
+    }
+
     async fn predict_sing_consonant_length<A: infer::AsyncExt>(
         &self,
         consonant: ndarray::Array1<i64>,
@@ -2729,6 +2767,38 @@ pub(crate) mod nonblocking {
                 style_id,
                 options: Default::default(),
             }
+        }
+
+        /// Frames with f0 == 0 (silence, unvoiced): safe places to split a decode.
+        #[doc(hidden)]
+        pub fn __unvoiced_frames(&self, audio_query: &AudioQuery) -> Result<(usize, Vec<usize>)> {
+            let f0 = audio_query.to_validated()?.decoder_feature(true).f0;
+            Ok((f0.len(), f0.iter().enumerate().filter(|(_, v)| **v == 0.).map(|(i, _)| i).collect()))
+        }
+
+        /// s16le PCM for frames `range` of `audio_query`.
+        #[doc(hidden)]
+        pub async fn __synthesis_range(
+            &self,
+            audio_query: &AudioQuery,
+            style_id: StyleId,
+            range: std::ops::Range<usize>,
+        ) -> Result<Vec<u8>> {
+            let audio_query = audio_query.to_validated()?;
+            let super::DecoderFeature { f0, phoneme } = audio_query.decoder_feature(true);
+            let n = f0.len();
+            let phoneme = ndarray::Array2::from_shape_vec(
+                [n, super::PhonemeCode::num_phoneme()],
+                phoneme.as_flattened().to_vec(),
+            )
+            .unwrap();
+            let range = range.start.min(n)..range.end.min(n);
+            let wave = self
+                .0
+                .status()
+                .decode_range::<BlockingThreadPool>(ndarray::arr1(&f0), phoneme, style_id, range)
+                .await?;
+            Ok(super::to_s16le_pcm(&wave, &audio_query))
         }
 
         /// AquesTalk風記法からAccentPhrase (アクセント句)の配列を生成する。
